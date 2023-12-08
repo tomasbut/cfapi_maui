@@ -1,12 +1,12 @@
-﻿using System.IO;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Security.Principal;
-using Vanara.Extensions;
-using Vanara.PInvoke;
 using Windows.Security.Cryptography;
 using Windows.Storage;
 using Windows.Storage.Provider;
-using static Vanara.PInvoke.CldApi;
+using Windows.Win32.Storage.CloudFilters;
+using Windows.Win32.Foundation;
+using Windows.Win32.Storage.FileSystem;
+using Windows.Win32;
 
 namespace MauiApp1
 {
@@ -18,11 +18,11 @@ namespace MauiApp1
         internal const string CloudName = "Test Cloud";
         internal const string StorageProviderAccount = "SomeAccount";
 
-        private readonly CF_CALLBACK_REGISTRATION[] _callbacks = [
+        private unsafe readonly CF_CALLBACK_REGISTRATION[] _callbacks = [
             new CF_CALLBACK_REGISTRATION
             {
                 Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
-                Callback = new CF_CALLBACK((in CF_CALLBACK_INFO x, in CF_CALLBACK_PARAMETERS y) => CfExecutePlaceholdersFetch(new FileSystemItem
+                Callback = new CF_CALLBACK((CF_CALLBACK_INFO* x, CF_CALLBACK_PARAMETERS* y) => CfExecutePlaceholdersFetch(new FileSystemItem
                 {
                     Id = Guid.NewGuid(),
                     RelativePath = "testFile.txt",
@@ -38,7 +38,7 @@ namespace MauiApp1
                 Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NONE
             }];
 
-        public CF_CONNECTION_KEY ConnectionKey { get; private set; }
+        internal CF_CONNECTION_KEY ConnectionKey { get; private set; }
 
         public async Task Connect()
         {
@@ -47,16 +47,19 @@ namespace MauiApp1
 
             StorageProviderSyncRootManager.Register(await CreateSyncRoot());
 
-            CfConnectSyncRoot(
-                SyncRootPath,
-                _callbacks,
-                nint.Zero,
-                CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
-                out var connectionKey);
+            unsafe
+            {
+                PInvoke.CfConnectSyncRoot(
+                    SyncRootPath,
+                    _callbacks,
+                    (void*)0,
+                    CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
+                    out var connectionKey);
 
-            ConnectionKey = connectionKey;
+                ConnectionKey = connectionKey;
 
-            CfUpdateSyncProviderStatus(ConnectionKey, CF_SYNC_PROVIDER_STATUS.CF_PROVIDER_STATUS_IDLE);
+                PInvoke.CfUpdateSyncProviderStatus(ConnectionKey, CF_SYNC_PROVIDER_STATUS.CF_PROVIDER_STATUS_IDLE);
+            }
         }
 
         private static void EnsureFeatureSupported()
@@ -105,66 +108,66 @@ namespace MauiApp1
             => $"{StorageProviderId}!{WindowsIdentity.GetCurrent().User}!{StorageProviderAccount}";
 
         #region Placeholder creation
-        private static void CfExecutePlaceholdersFetch(FileSystemItem placeholder, CF_CALLBACK_INFO callbackInfo)
+        private unsafe static void CfExecutePlaceholdersFetch(FileSystemItem placeholder, CF_CALLBACK_INFO* callbackInfo)
         {
             CF_OPERATION_INFO operationInfo = CreateOperationInfo(callbackInfo, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
-            CF_PLACEHOLDER_CREATE_INFO nativePlaceholder = CreatePlaceholder(placeholder);
+            CF_PLACEHOLDER_CREATE_INFO[] placeholdersArray = GC.AllocateArray<CF_PLACEHOLDER_CREATE_INFO>(1, true);
+            placeholdersArray[0] = CreatePlaceholder(placeholder);
 
-            IntPtr placeholderArray = Marshal.AllocHGlobal(Marshal.SizeOf<CF_PLACEHOLDER_CREATE_INFO>());
-            Marshal.StructureToPtr(nativePlaceholder, placeholderArray, false);
-
-            CF_OPERATION_PARAMETERS.TRANSFERPLACEHOLDERS placeholdersFetchParameter = new()
+            fixed (CF_PLACEHOLDER_CREATE_INFO* arrayPtr = placeholdersArray)
             {
-                PlaceholderArray = placeholderArray,
-                Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
-                PlaceholderCount = 1,
-                CompletionStatus = NTStatus.STATUS_SUCCESS,
-                PlaceholderTotalCount = 1,
-            };
+                CF_OPERATION_PARAMETERS opParams = new CF_OPERATION_PARAMETERS();
 
-            CF_OPERATION_PARAMETERS opParams = CF_OPERATION_PARAMETERS.Create(placeholdersFetchParameter);
+                opParams.Anonymous.TransferPlaceholders.PlaceholderArray = arrayPtr;
+                opParams.Anonymous.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION;
+                opParams.Anonymous.TransferPlaceholders.PlaceholderCount = 1;
+                opParams.Anonymous.TransferPlaceholders.CompletionStatus = new NTSTATUS(0);
+                opParams.Anonymous.TransferPlaceholders.PlaceholderTotalCount = 1;
+                opParams.ParamSize = (uint)Marshal.SizeOf(opParams);
 
-            HRESULT result = CfExecute(operationInfo, ref opParams);
-            result.ThrowIfFailed();
-
-            Marshal.FreeHGlobal(placeholderArray);
-            Marshal.FreeHGlobal(nativePlaceholder.FileIdentity);
+                HRESULT result = PInvoke.CfExecute(operationInfo, ref opParams);
+                result.ThrowOnFailure();
+            }
         }
 
-        private static CF_PLACEHOLDER_CREATE_INFO CreatePlaceholder(FileSystemItem placeholder)
+        private unsafe static CF_PLACEHOLDER_CREATE_INFO CreatePlaceholder(FileSystemItem placeholder)
         {
-            CF_PLACEHOLDER_CREATE_INFO cfInfo = new()
+            fixed(void* fileIdentityPtr = "a")
+            fixed(char* relativeFileName = placeholder.RelativePath.ToCharArray())
             {
-                FileIdentity = Marshal.StringToHGlobalUni("a"),
-                FileIdentityLength = 2 * 2,
-                RelativeFileName = placeholder.RelativePath,
-                FsMetadata = new CF_FS_METADATA
+                CF_PLACEHOLDER_CREATE_INFO cfInfo = new()
                 {
-                    FileSize = placeholder.Size,
-                    BasicInfo = new Kernel32.FILE_BASIC_INFO
+                    FileIdentity = fileIdentityPtr,
+                    FileIdentityLength = 2 * 2,
+                    RelativeFileName = relativeFileName,
+                    FsMetadata = new CF_FS_METADATA
                     {
-                        FileAttributes = (FileFlagsAndAttributes)placeholder.FileAttributes,
-                        CreationTime = FileTimeExtensions.MakeFILETIME((ulong)placeholder.CreationTime.ToFileTime()),
-                        LastWriteTime = FileTimeExtensions.MakeFILETIME((ulong)placeholder.LastWriteTime.ToFileTime()),
-                        LastAccessTime = FileTimeExtensions.MakeFILETIME((ulong)placeholder.LastAccessTime.ToFileTime()),
-                        ChangeTime = FileTimeExtensions.MakeFILETIME((ulong)placeholder.LastWriteTime.ToFileTime())
-                    }
-                },
-                Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
-            };
+                        FileSize = placeholder.Size,
+                        BasicInfo = new FILE_BASIC_INFO
+                        {
+                            FileAttributes = (uint)placeholder.FileAttributes,
+                            CreationTime = placeholder.CreationTime.ToFileTime(),
+                            LastWriteTime = placeholder.LastWriteTime.ToFileTime(),
+                            LastAccessTime = placeholder.LastAccessTime.ToFileTime(),
+                            ChangeTime = placeholder.LastWriteTime.ToFileTime()
+                        }
+                    },
+                    Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
+                };
 
-            return cfInfo;
+                return cfInfo;
+            }
         }
 
-        private static CF_OPERATION_INFO CreateOperationInfo(in CF_CALLBACK_INFO CallbackInfo, CF_OPERATION_TYPE OperationType)
+        private unsafe static CF_OPERATION_INFO CreateOperationInfo(CF_CALLBACK_INFO* CallbackInfo, CF_OPERATION_TYPE OperationType)
         {
             CF_OPERATION_INFO opInfo = new()
             {
                 Type = OperationType,
-                ConnectionKey = CallbackInfo.ConnectionKey,
-                TransferKey = CallbackInfo.TransferKey,
-                CorrelationVector = CallbackInfo.CorrelationVector,
-                RequestKey = CallbackInfo.RequestKey
+                ConnectionKey = (*CallbackInfo).ConnectionKey,
+                TransferKey = (*CallbackInfo).TransferKey,
+                CorrelationVector = (*CallbackInfo).CorrelationVector,
+                RequestKey = (*CallbackInfo).RequestKey
             };
 
             opInfo.StructSize = (uint)Marshal.SizeOf(opInfo);
